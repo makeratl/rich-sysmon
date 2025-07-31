@@ -158,21 +158,157 @@ class RichSystemMonitor:
         return f"[{color}]{bar}[/{color}] {percentage:5.1f}%"
     
     def create_system_info_panel(self, stats):
-        """Create system information panel"""
+        """Create system information panel without animation"""
         if not stats:
             return Panel("Error loading system stats", title="System Info", border_style="red")
-            
-        uptime_str = f"{stats['uptime'].days}d {stats['uptime'].seconds//3600}h {(stats['uptime'].seconds//60)%60}m"
-        
-        info_text = f"""[bold cyan]Hostname:[/bold cyan] {stats['hostname']}
-[bold cyan]System:[/bold cyan] {stats['system']} {platform.release()}
-[bold cyan]CPU Cores:[/bold cyan] {len(stats['cpu_cores'])}
-[bold cyan]Uptime:[/bold cyan] {uptime_str}
-[bold cyan]Memory Total:[/bold cyan] {stats['memory'].total / (1024**3):.1f} GB
-[bold cyan]Load Average:[/bold cyan] {stats['load_avg'][0]:.2f}, {stats['load_avg'][1]:.2f}, {stats['load_avg'][2]:.2f}"""
-        
-        return Panel(info_text, title="[bold blue]System Information[/bold blue]", border_style="blue")
-    
+
+        # Create enhanced load visualization
+        load_display = self._create_load_visualization(stats['load_avg'], len(stats['cpu_cores']))
+
+        # Create info text with focus on system specs and load
+        info_text = f"""🖥️  [bold white]{stats['hostname']}[/bold white]
+⚙️  [yellow]{len(stats['cpu_cores'])} CPU Cores[/yellow]
+💾 [magenta]{stats['memory'].total / (1024**3):.1f} GB RAM[/magenta]
+
+{load_display}"""
+
+        return Panel(info_text, title="[bold blue]🖥️ System Status[/bold blue]", border_style="blue")
+
+    def create_animation_panel(self, stats):
+        """Create separate animation panel with time and uptime"""
+        spinner_display = self._create_spinner_animation()
+
+        # Get current time and date (human-friendly)
+        now = datetime.datetime.now()
+        current_time = now.strftime("%I:%M:%S %p")
+        current_date = now.strftime("%A, %B %d")
+
+        # Format uptime
+        if stats:
+            uptime_str = f"{stats['uptime'].days}d {stats['uptime'].seconds//3600}h {(stats['uptime'].seconds//60)%60}m"
+        else:
+            uptime_str = "N/A"
+
+        # Combine animation with time info
+        time_info = f"""
+🕐 [bright_cyan]{current_time}[/bright_cyan]
+📅 [dim]{current_date}[/dim]
+⏱️  [green]{uptime_str}[/green]"""
+
+        content = Columns([spinner_display, time_info], equal=False, expand=True)
+        return Panel(content, title="[bold magenta]⚡ Live Status[/bold magenta]", border_style="magenta")
+
+    def _create_spinner_animation(self):
+        """Create an enhanced spinning animation with randomized colors and patterns"""
+        now = datetime.datetime.now()
+        second = now.second
+        minute = now.minute
+        hour = now.hour
+
+        # Time-seeded randomization for continuity
+        time_seed = (hour * 3600 + minute * 60 + second) // 10  # Changes every 10 seconds
+
+        # Color palettes that change based on time seed
+        color_palettes = [
+            {"primary": "bright_cyan", "secondary": "cyan", "accent": "blue", "center": "yellow"},
+            {"primary": "bright_magenta", "secondary": "magenta", "accent": "red", "center": "white"},
+            {"primary": "bright_green", "secondary": "green", "accent": "yellow", "center": "red"},
+            {"primary": "bright_yellow", "secondary": "yellow", "accent": "red", "center": "white"},
+            {"primary": "bright_blue", "secondary": "blue", "accent": "cyan", "center": "white"},
+            {"primary": "bright_red", "secondary": "red", "accent": "magenta", "center": "yellow"},
+        ]
+
+        # Select color palette based on time seed
+        palette = color_palettes[time_seed % len(color_palettes)]
+
+        # Different spinner patterns
+        spinners = [
+            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],  # Dots
+            ["◐", "◓", "◑", "◒"],  # Half circles
+            ["▁", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃"],  # Bars
+            ["◜", "◠", "◝", "◞", "◡", "◟"],  # Arcs
+            ["◢", "◣", "◤", "◥"],  # Triangles
+            ["⬢", "⬡", "⬢", "⬡"],  # Hexagons
+            ["◆", "◇", "◆", "◇"],  # Diamonds
+            ["⚬", "⚭", "⚬", "⚭"],  # Circles
+        ]
+
+        # Select spinner based on minute
+        spinner_set = spinners[minute % len(spinners)]
+        frame = spinner_set[second % len(spinner_set)]
+
+        # Use consistent-width outer elements to prevent shifting
+        outer_elements = ["∘", "○", "◦", "●", "◉", "⬢"]  # All single-width characters
+        outer_char = outer_elements[second % len(outer_elements)]
+
+        # Create brightness variations (safe markup)
+        brightness_cycle = second % 6
+        if brightness_cycle < 2:
+            outer_color = "dim"
+            ring_color = "bright_cyan"
+        elif brightness_cycle < 4:
+            outer_color = "cyan"
+            ring_color = "bright_blue"
+        else:
+            outer_color = "bright_cyan"
+            ring_color = "blue"
+
+        # Create pulsing center elements (consistent width)
+        center_chars = ["●", "◉", "◎", "⬢", "◆"]  # All single-width characters
+        center_char = center_chars[(second // 2) % len(center_chars)]
+
+        # Get center color from palette
+        center_color = palette['center']
+        accent_color = palette['accent']
+
+        # Create radiating pattern with safe markup
+        radiating = [
+            f"     [{outer_color}]{outer_char}[/{outer_color}]     ",
+            f"   [{outer_color}]{outer_char}[/{outer_color}] [{ring_color}]∘[/{ring_color}] [{outer_color}]{outer_char}[/{outer_color}]   ",
+            f" [{outer_color}]{outer_char}[/{outer_color}] [{ring_color}]∘[/{ring_color}] [bold {accent_color}]{center_char}[/bold {accent_color}] [{ring_color}]∘[/{ring_color}] [{outer_color}]{outer_char}[/{outer_color}] ",
+            f"   [{ring_color}]∘[/{ring_color}] [bold {center_color}]{frame}[/bold {center_color}] [{ring_color}]∘[/{ring_color}]   ",
+            f" [{outer_color}]{outer_char}[/{outer_color}] [{ring_color}]∘[/{ring_color}] [bold {accent_color}]{center_char}[/bold {accent_color}] [{ring_color}]∘[/{ring_color}] [{outer_color}]{outer_char}[/{outer_color}] ",
+            f"   [{outer_color}]{outer_char}[/{outer_color}] [{ring_color}]∘[/{ring_color}] [{outer_color}]{outer_char}[/{outer_color}]   ",
+            f"     [{outer_color}]{outer_char}[/{outer_color}]     "
+        ]
+
+        return "\n".join(radiating)
+
+    def _create_load_visualization(self, load_avg, cpu_count):
+        """Create enhanced load average visualization"""
+        load_1min, load_5min, load_15min = load_avg
+
+        # Calculate load percentages relative to CPU count
+        load_1_pct = (load_1min / cpu_count) * 100
+        load_5_pct = (load_5min / cpu_count) * 100
+        load_15_pct = (load_15min / cpu_count) * 100
+
+        # Create visual bars for each load average
+        def create_load_bar(load_val, load_pct):
+            bar_length = 12
+            filled = int(min(load_pct / 100 * bar_length, bar_length))
+            empty = bar_length - filled
+
+            if load_pct > 80:
+                color = "red"
+                status = "HIGH"
+            elif load_pct > 50:
+                color = "yellow"
+                status = "MED"
+            else:
+                color = "green"
+                status = "LOW"
+
+            bar = "█" * filled + "░" * empty
+            return f"[{color}]{bar}[/{color}] {load_val:4.2f} [{color}]{status}[/{color}]"
+
+        load_display = f"""📊 [bold white]System Load Average[/bold white]
+┌─ 1min:  {create_load_bar(load_1min, load_1_pct)}
+├─ 5min:  {create_load_bar(load_5min, load_5_pct)}
+└─ 15min: {create_load_bar(load_15min, load_15_pct)}"""
+
+        return load_display
+
     def create_resource_panel(self, stats):
         """Create resource usage panel"""
         if not stats:
@@ -313,18 +449,66 @@ class RichSystemMonitor:
         )
     
     def create_cpu_cores_panel(self, stats):
-        """Create CPU cores panel"""
+        """Create CPU cores panel with vertical equalizer-style bars"""
         if not stats:
             return Panel("Error loading CPU stats", title="CPU Cores", border_style="red")
-            
-        cores_text = ""
-        for i, usage in enumerate(stats['cpu_cores']):
-            color = "red" if usage > 80 else "yellow" if usage > 60 else "green"
-            bar_length = int(usage / 5)  # Scale to 20 chars
-            bar = "█" * bar_length + "░" * (20 - bar_length)
-            cores_text += f"Core {i:2d}: [{color}]{bar}[/{color}] {usage:5.1f}%\n"
-        
-        return Panel(cores_text.rstrip(), title="[bold yellow]CPU Cores[/bold yellow]", border_style="yellow")
+
+        # Create vertical equalizer display
+        max_height = 8  # Height of the equalizer bars
+        cores = stats['cpu_cores']
+
+        # Build the equalizer from top to bottom
+        equalizer_lines = []
+
+        # Create vertical bars (from top to bottom)
+        for row in range(max_height):
+            line = ""
+            for i, usage in enumerate(cores):
+                # Calculate how many bars this core should have
+                bars_needed = int((usage / 100) * max_height)
+
+                # Determine if this row should have a bar (counting from bottom)
+                current_row_from_bottom = max_height - row - 1
+
+                if current_row_from_bottom < bars_needed:
+                    # Choose color based on usage
+                    if usage > 80:
+                        color = "red"
+                    elif usage > 60:
+                        color = "yellow"
+                    elif usage > 30:
+                        color = "green"
+                    else:
+                        color = "blue"
+
+                    # Align bars with numbers: right-align in 2-char field + space
+                    if i < len(cores) - 1:
+                        line += f" [{color}]█[/{color}] "  # Space + bar + space to match " 0 "
+                    else:
+                        line += f" [{color}]█[/{color}]"   # Last: space + bar (matches "15")
+                else:
+                    # Show empty bar for contrast with same spacing
+                    if i < len(cores) - 1:
+                        line += " [dim]░[/dim] "  # Space + bar + space
+                    else:
+                        line += " [dim]░[/dim]"   # Last: space + bar
+
+            equalizer_lines.append(line.rstrip())
+
+        # Add core numbers at the bottom with consistent spacing
+        # Each column should be 2 characters wide to accommodate double-digit numbers
+        core_line = ""
+        for i, usage in enumerate(cores):
+            # Format each number to take exactly 2 characters (right-aligned)
+            core_line += f"{i:>2}"
+            if i < len(cores) - 1:
+                core_line += " "  # Single space between numbers
+
+        equalizer_lines.append(core_line)
+
+        equalizer_display = "\n".join(equalizer_lines)
+
+        return Panel(equalizer_display, title="[bold yellow]🎚️ CPU Equalizer[/bold yellow]", border_style="yellow")
     
     def create_top_memory_panel(self, processes):
         """Create top memory processes panel"""
@@ -399,10 +583,11 @@ class RichSystemMonitor:
             Layout(name="bottom_row", ratio=2)   # 3-column section
         )
 
-        # Split top row into two columns (system info and resources)
+        # Split top row into three columns (system info, resources, and animation)
         layout["top_row"].split_row(
             Layout(name="system_info"),
-            Layout(name="resources")
+            Layout(name="resources"),
+            Layout(name="animation", ratio=1)
         )
 
         # Middle row for disk usage (full width for explorer view)
@@ -422,14 +607,15 @@ class RichSystemMonitor:
         stats = self.get_system_stats()
         processes = self.get_top_processes()
 
-        # Header
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Header with AM/PM time
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
         header_text = Text(f"Rich System Monitor - {current_time}", style="bold white on blue")
         layout["header"].update(Align.center(header_text))
 
         # Update panels
         layout["system_info"].update(self.create_system_info_panel(stats))
         layout["resources"].update(self.create_resource_panel(stats))
+        layout["animation"].update(self.create_animation_panel(stats))
         layout["middle_row"].update(self.create_disk_panel(stats))
         layout["cpu_cores"].update(self.create_cpu_cores_panel(stats))
         layout["top_memory"].update(self.create_top_memory_panel(processes))
