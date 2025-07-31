@@ -53,12 +53,12 @@ class RichSystemMonitor:
             return None
 
     def get_disk_info(self):
-        """Get detailed disk information for all mounted drives"""
+        """Get detailed disk information for all mounted drives including USB"""
         disk_info = []
         try:
             partitions = psutil.disk_partitions()
             for partition in partitions:
-                # Skip snap mounts and other virtual filesystems
+                # Skip snap mounts and other virtual filesystems, but include USB drives
                 if (partition.fstype in ['squashfs', 'tmpfs', 'devtmpfs'] or
                     '/snap/' in partition.mountpoint or
                     partition.mountpoint in ['/dev', '/proc', '/sys', '/run']):
@@ -68,6 +68,9 @@ class RichSystemMonitor:
                     usage = psutil.disk_usage(partition.mountpoint)
                     # Only include drives with significant size (> 100MB)
                     if usage.total > 100 * 1024 * 1024:
+                        # Determine drive type
+                        drive_type = self._get_drive_type(partition)
+
                         disk_info.append({
                             'device': partition.device,
                             'mountpoint': partition.mountpoint,
@@ -75,16 +78,46 @@ class RichSystemMonitor:
                             'total': usage.total,
                             'used': usage.used,
                             'free': usage.free,
-                            'percent': usage.percent
+                            'percent': usage.percent,
+                            'drive_type': drive_type
                         })
                 except PermissionError:
                     continue
 
-            # Sort by mountpoint, with root filesystem first
-            disk_info.sort(key=lambda x: (x['mountpoint'] != '/', x['mountpoint']))
+            # Sort by drive type and mountpoint (root first, then internal, then external)
+            disk_info.sort(key=lambda x: (
+                x['drive_type'] != 'system',
+                x['drive_type'] != 'internal',
+                x['drive_type'] != 'external',
+                x['mountpoint'] != '/',
+                x['mountpoint']
+            ))
             return disk_info
         except Exception:
             return []
+
+    def _get_drive_type(self, partition):
+        """Determine if drive is system, internal, or external (USB)"""
+        device = partition.device
+        mountpoint = partition.mountpoint
+
+        # System drives
+        if mountpoint in ['/', '/boot', '/boot/efi']:
+            return 'system'
+
+        # External drives (USB, etc.)
+        if ('/media/' in mountpoint or
+            '/mnt/' in mountpoint or
+            'usb' in mountpoint.lower() or
+            'removable' in mountpoint.lower()):
+            return 'external'
+
+        # Check device name patterns for USB drives
+        if ('/dev/sd' in device and
+            device not in ['/dev/sda1', '/dev/sda2', '/dev/sda3']):  # Assume sda is main drive
+            return 'external'
+
+        return 'internal'
     
     def get_top_processes(self, count=8):
         """Get top processes by CPU and memory usage"""
@@ -169,44 +202,115 @@ class RichSystemMonitor:
         return Panel(table, title="[bold green]Resource Usage[/bold green]", border_style="green")
 
     def create_disk_panel(self, stats):
-        """Create detailed disk usage panel"""
+        """Create card-based disk usage panel"""
         if not stats or not stats['disk_partitions']:
-            return Panel("Error loading disk stats", title="Disk Usage", border_style="red")
+            return Panel("Error loading disk stats", title="Storage Dashboard", border_style="red")
 
-        table = Table(show_header=True, header_style="bold cyan", box=box.SIMPLE)
-        table.add_column("Device", style="white", width=20)
-        table.add_column("Mount", style="cyan", width=15)
-        table.add_column("Size", style="white", width=10)
-        table.add_column("Used", style="yellow", width=10)
-        table.add_column("Free", style="green", width=10)
-        table.add_column("Usage", width=25)
+        # Create cards for each drive
+        drive_cards = []
 
         for disk in stats['disk_partitions']:
-            # Format sizes
-            total_gb = disk['total'] / (1024**3)
-            used_gb = disk['used'] / (1024**3)
-            free_gb = disk['free'] / (1024**3)
+            card = self._create_drive_card(disk)
+            drive_cards.append(card)
 
-            # Create progress bar
-            usage_bar = self.create_progress_bar(disk['percent'])
+        # Arrange cards in a responsive grid
+        cards_layout = Columns(drive_cards, equal=False, expand=False)
 
-            # Determine device display name
-            device_name = disk['device']
-            if '/dev/mapper/' in device_name:
-                device_name = device_name.split('/')[-1][:18]
-            elif '/dev/sd' in device_name:
-                device_name = device_name.split('/')[-1]
+        return Panel(cards_layout, title="[bold cyan]💾 Storage Dashboard[/bold cyan]", border_style="cyan")
 
-            table.add_row(
-                device_name,
-                disk['mountpoint'],
-                f"{total_gb:.1f}G",
-                f"{used_gb:.1f}G",
-                f"{free_gb:.1f}G",
-                usage_bar
-            )
+    def _create_drive_card(self, disk):
+        """Create a card-style display for a single drive"""
+        # Format sizes
+        if disk['total'] > 1024**4:  # TB
+            total_size = f"{disk['total'] / (1024**4):.1f}TB"
+            used_size = f"{disk['used'] / (1024**4):.1f}TB"
+            free_size = f"{disk['free'] / (1024**4):.1f}TB"
+        else:  # GB
+            total_size = f"{disk['total'] / (1024**3):.0f}GB"
+            used_size = f"{disk['used'] / (1024**3):.0f}GB"
+            free_size = f"{disk['free'] / (1024**3):.0f}GB"
 
-        return Panel(table, title="[bold cyan]Disk Usage[/bold cyan]", border_style="cyan")
+        # Determine icon and colors based on drive type
+        if disk['drive_type'] == 'system':
+            if disk['mountpoint'] == '/':
+                icon = "🖥️"
+                title_color = "bold blue"
+                border_color = "blue"
+            else:
+                icon = "⚙️"
+                title_color = "bold cyan"
+                border_color = "cyan"
+        elif disk['drive_type'] == 'external':
+            icon = "🔌"
+            title_color = "bold yellow"
+            border_color = "yellow"
+        else:
+            icon = "💿"
+            title_color = "bold green"
+            border_color = "green"
+
+        # Create progress bar
+        percent = disk['percent']
+        bar_length = 16
+        filled = int(percent / 100 * bar_length)
+        empty = bar_length - filled
+
+        if percent > 80:
+            bar_color = "red"
+        elif percent > 60:
+            bar_color = "yellow"
+        else:
+            bar_color = "green"
+
+        bar = "█" * filled + "░" * empty
+        usage_bar = f"[{bar_color}]{bar}[/{bar_color}]"
+
+        # Get device name (truncate to fit card width)
+        device_name = disk['device']
+        if '/dev/mapper/' in device_name:
+            device_name = device_name.split('/')[-1][:10]  # Shorter for mapper devices
+        elif '/dev/sd' in device_name:
+            device_name = device_name.split('/')[-1]
+
+        # Ensure device name fits in card
+        if len(device_name) > 12:
+            device_name = device_name[:12]
+
+        # Format mount point - show first 10 chars of last segment or special names
+        mount_path = disk['mountpoint']
+        if mount_path == '/':
+            mount_display = 'root'
+        elif mount_path == '/boot':
+            mount_display = 'boot'
+        elif mount_path == '/boot/efi':
+            mount_display = 'efi'
+        else:
+            # Get the last segment of the path (after the last /)
+            last_segment = mount_path.split('/')[-1]
+            # Take first 10 characters of that segment
+            mount_display = last_segment[:10] if len(last_segment) > 10 else last_segment
+            # If the last segment is empty (path ends with /), use the second-to-last segment
+            if not mount_display and len(mount_path.split('/')) > 1:
+                last_segment = mount_path.split('/')[-2]
+                mount_display = last_segment[:10] if len(last_segment) > 10 else last_segment
+
+        # Create card content
+        card_content = f"""{icon} [{title_color}]{device_name}[/{title_color}]
+[dim]{disk['fstype']}[/dim]
+
+📂 [cyan]{mount_display}[/cyan]
+
+{usage_bar} [white]{percent:.0f}%[/white]
+
+💾 [white]{used_size}[/white] / [green]{total_size}[/green]
+🆓 [bright_green]{free_size}[/bright_green]"""
+
+        return Panel(
+            card_content,
+            border_style=border_color,
+            padding=(0, 1),
+            width=20  # Slightly smaller to prevent wrapping
+        )
     
     def create_cpu_cores_panel(self, stats):
         """Create CPU cores panel"""
@@ -222,60 +326,64 @@ class RichSystemMonitor:
         
         return Panel(cores_text.rstrip(), title="[bold yellow]CPU Cores[/bold yellow]", border_style="yellow")
     
-    def create_processes_panel(self, processes):
-        """Create enhanced top processes panel with both CPU and memory views"""
-        if not processes or (not processes['memory'] and not processes['cpu']):
-            return Panel("Error loading process stats", title="Top Processes", border_style="red")
+    def create_top_memory_panel(self, processes):
+        """Create top memory processes panel"""
+        if not processes or not processes['memory']:
+            return Panel("Error loading memory stats", title="Top Memory", border_style="red")
 
-        # Create two tables side by side
-        memory_table = Table(show_header=True, header_style="bold green", box=box.SIMPLE, title="Top Memory")
-        memory_table.add_column("PID", style="cyan", width=6)
-        memory_table.add_column("Name", style="white", width=12)
-        memory_table.add_column("MEM%", style="green", width=6)
-        memory_table.add_column("Visual", width=15)
+        table = Table(show_header=True, header_style="bold green", box=box.SIMPLE)
+        table.add_column("PID", style="cyan", width=6)
+        table.add_column("Process", style="white", width=12)
+        table.add_column("MEM%", style="green", width=6)
+        table.add_column("Usage", width=15)
 
-        for proc in processes['memory'][:6]:  # Show top 6
+        for proc in processes['memory'][:8]:  # Show top 8
             mem_percent = proc['memory_percent']
             # Create mini progress bar
-            bar_length = int(mem_percent / 2)  # Scale to 50 chars max
+            bar_length = int(mem_percent / 2)  # Scale for display
             bar = "█" * min(bar_length, 15) + "░" * max(0, 15 - bar_length)
             color = "red" if mem_percent > 10 else "yellow" if mem_percent > 5 else "green"
             visual_bar = f"[{color}]{bar}[/{color}]"
 
-            memory_table.add_row(
+            table.add_row(
                 str(proc['pid']),
                 proc['name'][:10],
                 f"{mem_percent:.1f}",
                 visual_bar
             )
 
-        cpu_table = Table(show_header=True, header_style="bold yellow", box=box.SIMPLE, title="Top CPU")
-        cpu_table.add_column("PID", style="cyan", width=6)
-        cpu_table.add_column("Name", style="white", width=12)
-        cpu_table.add_column("CPU%", style="yellow", width=6)
-        cpu_table.add_column("Visual", width=15)
+        return Panel(table, title="[bold green]🧠 Top Memory[/bold green]", border_style="green")
 
-        for proc in processes['cpu'][:6]:  # Show top 6
+    def create_top_cpu_panel(self, processes):
+        """Create top CPU processes panel"""
+        if not processes or not processes['cpu']:
+            return Panel("Error loading CPU stats", title="Top CPU", border_style="red")
+
+        table = Table(show_header=True, header_style="bold yellow", box=box.SIMPLE)
+        table.add_column("PID", style="cyan", width=6)
+        table.add_column("Process", style="white", width=12)
+        table.add_column("CPU%", style="yellow", width=6)
+        table.add_column("Usage", width=15)
+
+        for proc in processes['cpu'][:8]:  # Show top 8
             cpu_percent = proc['cpu_percent'] or 0
             # Create mini progress bar
-            bar_length = int(cpu_percent / 2)  # Scale to 50 chars max
+            bar_length = int(cpu_percent / 2)  # Scale for display
             bar = "█" * min(bar_length, 15) + "░" * max(0, 15 - bar_length)
             color = "red" if cpu_percent > 50 else "yellow" if cpu_percent > 20 else "green"
             visual_bar = f"[{color}]{bar}[/{color}]"
 
-            cpu_table.add_row(
+            table.add_row(
                 str(proc['pid']),
                 proc['name'][:10],
                 f"{cpu_percent:.1f}",
                 visual_bar
             )
 
-        # Combine tables in columns
-        tables = Columns([memory_table, cpu_table], equal=True, expand=True)
-        return Panel(tables, title="[bold red]Top Processes[/bold red]", border_style="red")
+        return Panel(table, title="[bold yellow]⚡ Top CPU[/bold yellow]", border_style="yellow")
     
     def create_layout(self):
-        """Create the enhanced main layout"""
+        """Create the enhanced main layout with 3-column bottom section"""
         layout = Layout()
 
         # Split into header and body
@@ -287,8 +395,8 @@ class RichSystemMonitor:
         # Split body into three rows for better organization
         layout["body"].split_column(
             Layout(name="top_row", ratio=2),
-            Layout(name="middle_row", ratio=2),
-            Layout(name="bottom_row", ratio=3)
+            Layout(name="middle_row", ratio=3),  # Give more space to disk explorer
+            Layout(name="bottom_row", ratio=2)   # 3-column section
         )
 
         # Split top row into two columns (system info and resources)
@@ -297,14 +405,15 @@ class RichSystemMonitor:
             Layout(name="resources")
         )
 
-        # Split middle row into two columns (CPU cores and disk usage)
-        layout["middle_row"].split_row(
-            Layout(name="cpu_cores"),
-            Layout(name="disk_usage")
-        )
+        # Middle row for disk usage (full width for explorer view)
+        # (middle_row is already created, no need to reassign)
 
-        # Bottom row for processes (full width)
-        layout["bottom_row"].update(Layout(name="processes"))
+        # Split bottom row into three columns (CPU cores, top memory, top CPU)
+        layout["bottom_row"].split_row(
+            Layout(name="cpu_cores"),
+            Layout(name="top_memory"),
+            Layout(name="top_cpu")
+        )
 
         return layout
     
@@ -321,9 +430,10 @@ class RichSystemMonitor:
         # Update panels
         layout["system_info"].update(self.create_system_info_panel(stats))
         layout["resources"].update(self.create_resource_panel(stats))
+        layout["middle_row"].update(self.create_disk_panel(stats))
         layout["cpu_cores"].update(self.create_cpu_cores_panel(stats))
-        layout["disk_usage"].update(self.create_disk_panel(stats))
-        layout["bottom_row"].update(self.create_processes_panel(processes))
+        layout["top_memory"].update(self.create_top_memory_panel(processes))
+        layout["top_cpu"].update(self.create_top_cpu_panel(processes))
     
     def run_live_monitor(self, refresh_rate=1.0):
         """Run the live monitoring display"""
