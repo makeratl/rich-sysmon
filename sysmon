@@ -1,0 +1,8 @@
+#!/bin/bash
+# Rich System Monitor - Convenient Wrapper Script
+# Simple wrapper that calls run.sh with all arguments
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Call the main run script with all arguments
+exec "$SCRIPT_DIR/run.sh" "$@"
