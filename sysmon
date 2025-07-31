@@ -2,6 +2,7 @@
 # Rich System Monitor - Convenient Wrapper Script
 # Simple wrapper that calls run.sh with all arguments
 
+# Get the absolute path to this script's directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Call the main run script with all arguments
