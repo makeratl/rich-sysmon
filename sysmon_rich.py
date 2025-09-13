@@ -10,6 +10,9 @@ import datetime
 import os
 import time
 import sys
+import subprocess
+import json
+import re
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -53,15 +56,16 @@ class RichSystemMonitor:
             return None
 
     def get_disk_info(self):
-        """Get detailed disk information for all mounted drives including USB"""
+        """Get detailed disk information for user drives (excluding boot/efi)"""
         disk_info = []
         try:
             partitions = psutil.disk_partitions()
             for partition in partitions:
-                # Skip snap mounts and other virtual filesystems, but include USB drives
+                # Skip snap mounts, virtual filesystems, and boot partitions
+                skip_mounts = ['/dev', '/proc', '/sys', '/run', '/boot', '/boot/efi']
                 if (partition.fstype in ['squashfs', 'tmpfs', 'devtmpfs'] or
                     '/snap/' in partition.mountpoint or
-                    partition.mountpoint in ['/dev', '/proc', '/sys', '/run']):
+                    partition.mountpoint in skip_mounts):
                     continue
 
                 try:
@@ -84,14 +88,20 @@ class RichSystemMonitor:
                 except PermissionError:
                     continue
 
-            # Sort by drive type and mountpoint (root first, then internal, then external)
-            disk_info.sort(key=lambda x: (
-                x['drive_type'] != 'system',
-                x['drive_type'] != 'internal',
-                x['drive_type'] != 'external',
-                x['mountpoint'] != '/',
-                x['mountpoint']
-            ))
+            # Sort by priority: root first, then ai-storage, then others
+            def sort_priority(x):
+                if x['mountpoint'] == '/':
+                    return (0, x['mountpoint'])
+                elif x['mountpoint'] == '/ai-storage':
+                    return (1, x['mountpoint'])
+                elif x['mountpoint'] == '/cold-storage':
+                    return (2, x['mountpoint'])
+                elif 'masstore' in x['mountpoint']:
+                    return (3, x['mountpoint'])
+                else:
+                    return (4, x['mountpoint'])
+
+            disk_info.sort(key=sort_priority)
             return disk_info
         except Exception:
             return []
@@ -101,9 +111,13 @@ class RichSystemMonitor:
         device = partition.device
         mountpoint = partition.mountpoint
 
-        # System drives
-        if mountpoint in ['/', '/boot', '/boot/efi']:
+        # System drives (root filesystem)
+        if mountpoint == '/':
             return 'system'
+
+        # AI storage and cold storage are internal
+        if mountpoint in ['/ai-storage', '/cold-storage']:
+            return 'internal'
 
         # External drives (USB, etc.)
         if ('/media/' in mountpoint or
@@ -112,13 +126,42 @@ class RichSystemMonitor:
             'removable' in mountpoint.lower()):
             return 'external'
 
-        # Check device name patterns for USB drives
-        if ('/dev/sd' in device and
-            device not in ['/dev/sda1', '/dev/sda2', '/dev/sda3']):  # Assume sda is main drive
-            return 'external'
-
         return 'internal'
-    
+
+    def get_gpu_info(self):
+        """Get NVIDIA GPU information using nvidia-smi"""
+        try:
+            # Run nvidia-smi to get GPU information
+            result = subprocess.run([
+                'nvidia-smi',
+                '--query-gpu=index,name,temperature.gpu,power.draw,power.limit,memory.used,memory.total,utilization.gpu',
+                '--format=csv,noheader,nounits'
+            ], capture_output=True, text=True, timeout=5)
+
+            if result.returncode != 0:
+                return None
+
+            gpu_info = []
+            for line in result.stdout.strip().split('\n'):
+                if line.strip():
+                    parts = [part.strip() for part in line.split(',')]
+                    if len(parts) >= 8:
+                        gpu_info.append({
+                            'index': int(parts[0]),
+                            'name': parts[1],
+                            'temperature': int(parts[2]) if parts[2] != '[Not Supported]' else 0,
+                            'power_draw': float(parts[3]) if parts[3] != '[Not Supported]' else 0,
+                            'power_limit': float(parts[4]) if parts[4] != '[Not Supported]' else 250,
+                            'memory_used': int(parts[5]),
+                            'memory_total': int(parts[6]),
+                            'utilization': int(parts[7]) if parts[7] != '[Not Supported]' else 0
+                        })
+
+            return gpu_info
+
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, ValueError):
+            return None
+
     def get_top_processes(self, count=8):
         """Get top processes by CPU and memory usage"""
         try:
@@ -338,21 +381,78 @@ class RichSystemMonitor:
         return Panel(table, title="[bold green]Resource Usage[/bold green]", border_style="green")
 
     def create_disk_panel(self, stats):
-        """Create card-based disk usage panel"""
+        """Create compact disk usage panel"""
         if not stats or not stats['disk_partitions']:
             return Panel("Error loading disk stats", title="Storage Dashboard", border_style="red")
 
-        # Create cards for each drive
-        drive_cards = []
+        # Create a table for more compact display
+        table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+        table.add_column("Drive", width=12)
+        table.add_column("Usage", width=20)
+        table.add_column("Size", width=12)
 
-        for disk in stats['disk_partitions']:
-            card = self._create_drive_card(disk)
-            drive_cards.append(card)
+        for disk in stats['disk_partitions'][:4]:  # Show up to 4 drives
+            # Determine icon and colors
+            if disk['drive_type'] == 'system':
+                icon = "🖥️"
+                color = "blue"
+            elif disk['drive_type'] == 'internal':
+                if 'ai-storage' in disk['mountpoint']:
+                    icon = "🤖"
+                    color = "green"
+                elif 'cold-storage' in disk['mountpoint']:
+                    icon = "❄️"
+                    color = "cyan"
+                else:
+                    icon = "💿"
+                    color = "green"
+            else:
+                icon = "🔌"
+                color = "yellow"
 
-        # Arrange cards in a responsive grid
-        cards_layout = Columns(drive_cards, equal=False, expand=False)
+            # Create usage bar
+            percent = disk['percent']
+            bar_length = 12
+            filled = int(percent / 100 * bar_length)
+            empty = bar_length - filled
 
-        return Panel(cards_layout, title="[bold cyan]💾 Storage Dashboard[/bold cyan]", border_style="cyan")
+            if percent > 80:
+                bar_color = "red"
+            elif percent > 60:
+                bar_color = "yellow"
+            else:
+                bar_color = "green"
+
+            bar = "█" * filled + "░" * empty
+            usage_bar = f"[{bar_color}]{bar}[/{bar_color}] {percent:.0f}%"
+
+            # Format sizes
+            if disk['total'] > 1024**4:  # TB
+                total_size = f"{disk['total'] / (1024**4):.1f}TB"
+                used_size = f"{disk['used'] / (1024**4):.1f}TB"
+            else:  # GB
+                total_size = f"{disk['total'] / (1024**3):.0f}GB"
+                used_size = f"{disk['used'] / (1024**3):.0f}GB"
+
+            # Get mount display name
+            mount_path = disk['mountpoint']
+            if mount_path == '/':
+                mount_display = 'root'
+            elif 'ai-storage' in mount_path:
+                mount_display = 'ai-storage'
+            elif 'cold-storage' in mount_path:
+                mount_display = 'cold-storage'
+            elif 'masstore' in mount_path:
+                mount_display = 'masstore02'
+            else:
+                mount_display = mount_path.split('/')[-1][:10]
+
+            drive_info = f"{icon} [{color}]{mount_display}[/{color}]"
+            size_info = f"{used_size}/{total_size}"
+
+            table.add_row(drive_info, usage_bar, size_info)
+
+        return Panel(table, title="[bold cyan]💾 Storage Dashboard[/bold cyan]", border_style="cyan")
 
     def _create_drive_card(self, disk):
         """Create a card-style display for a single drive"""
@@ -430,22 +530,17 @@ class RichSystemMonitor:
                 last_segment = mount_path.split('/')[-2]
                 mount_display = last_segment[:10] if len(last_segment) > 10 else last_segment
 
-        # Create card content
+        # Create very compact card content
         card_content = f"""{icon} [{title_color}]{device_name}[/{title_color}]
-[dim]{disk['fstype']}[/dim]
-
-📂 [cyan]{mount_display}[/cyan]
-
-{usage_bar} [white]{percent:.0f}%[/white]
-
-💾 [white]{used_size}[/white] / [green]{total_size}[/green]
-🆓 [bright_green]{free_size}[/bright_green]"""
+📂 {mount_display}
+{usage_bar} {percent:.0f}%
+{used_size}/{total_size}"""
 
         return Panel(
             card_content,
             border_style=border_color,
-            padding=(0, 1),
-            width=20  # Slightly smaller to prevent wrapping
+            padding=(0, 0),
+            width=16  # Very compact to fit 4 drives
         )
     
     def create_cpu_cores_panel(self, stats):
@@ -565,9 +660,78 @@ class RichSystemMonitor:
             )
 
         return Panel(table, title="[bold yellow]⚡ Top CPU[/bold yellow]", border_style="yellow")
-    
+
+    def create_gpu_panel(self):
+        """Create GPU monitoring panel for dual GPU setup"""
+        gpu_info = self.get_gpu_info()
+
+        if not gpu_info:
+            return Panel(
+                "[dim]NVIDIA GPU not detected\nor nvidia-smi not available[/dim]",
+                title="[bold red]🎮 GPU Status[/bold red]",
+                border_style="red"
+            )
+
+        # Create content for each GPU
+        gpu_displays = []
+        total_vram_used = 0
+        total_vram_total = 0
+
+        for gpu in gpu_info:
+            # Calculate percentages
+            vram_percent = (gpu['memory_used'] / gpu['memory_total']) * 100
+            power_percent = (gpu['power_draw'] / gpu['power_limit']) * 100
+
+            # Determine warning colors
+            temp_color = "red" if gpu['temperature'] > 80 else "yellow" if gpu['temperature'] > 70 else "green"
+            vram_color = "red" if vram_percent > 90 else "yellow" if vram_percent > 75 else "green"
+            power_color = "red" if power_percent > 90 else "yellow" if power_percent > 75 else "green"
+            util_color = "green" if gpu['utilization'] > 50 else "yellow" if gpu['utilization'] > 20 else "blue"
+
+            # Create compact VRAM usage bar
+            vram_bar_length = 12
+            vram_filled = int(vram_percent / 100 * vram_bar_length)
+            vram_empty = vram_bar_length - vram_filled
+            vram_bar = "█" * vram_filled + "░" * vram_empty
+
+            # Create compact utilization bar
+            util_bar_length = 10
+            util_filled = int(gpu['utilization'] / 100 * util_bar_length)
+            util_empty = util_bar_length - util_filled
+            util_bar = "█" * util_filled + "░" * util_empty
+
+            # Format memory sizes
+            vram_used_gb = gpu['memory_used'] / 1024
+            vram_total_gb = gpu['memory_total'] / 1024
+
+            # Create compact GPU display
+            gpu_display = f"""🎮 [bold white]GPU {gpu['index']}: GTX 1080 Ti[/bold white]
+[{temp_color}]{gpu['temperature']}°C[/{temp_color}] [{power_color}]{gpu['power_draw']:.0f}W[/{power_color}] [{util_color}]{gpu['utilization']}%[/{util_color}]
+[{util_color}]{util_bar}[/{util_color}] Util
+[{vram_color}]{vram_bar}[/{vram_color}] {vram_used_gb:.1f}GB"""
+
+            gpu_displays.append(gpu_display)
+            total_vram_used += gpu['memory_used']
+            total_vram_total += gpu['memory_total']
+
+        # Add total VRAM summary
+        total_vram_percent = (total_vram_used / total_vram_total) * 100
+        total_color = "red" if total_vram_percent > 90 else "yellow" if total_vram_percent > 75 else "green"
+        total_used_gb = total_vram_used / 1024
+        total_total_gb = total_vram_total / 1024
+
+        total_display = f"\n💾 [bold {total_color}]Total: {total_used_gb:.1f}/{total_total_gb:.1f}GB[/bold {total_color}]"
+
+        # Combine all displays
+        content = "\n\n".join(gpu_displays) + total_display
+
+        # Determine overall border color based on any warnings
+        border_color = "red" if any(gpu['temperature'] > 80 or (gpu['memory_used']/gpu['memory_total']) > 0.9 for gpu in gpu_info) else "green"
+
+        return Panel(content, title="[bold cyan]🎮 GPU Dashboard[/bold cyan]", border_style=border_color)
+
     def create_layout(self):
-        """Create the enhanced main layout with 3-column bottom section"""
+        """Create the enhanced main layout with GPU panel next to storage"""
         layout = Layout()
 
         # Split into header and body
@@ -579,7 +743,7 @@ class RichSystemMonitor:
         # Split body into three rows for better organization
         layout["body"].split_column(
             Layout(name="top_row", ratio=2),
-            Layout(name="middle_row", ratio=3),  # Give more space to disk explorer
+            Layout(name="middle_row", ratio=3),  # Storage + GPU row
             Layout(name="bottom_row", ratio=2)   # 3-column section
         )
 
@@ -590,8 +754,11 @@ class RichSystemMonitor:
             Layout(name="animation", ratio=1)
         )
 
-        # Middle row for disk usage (full width for explorer view)
-        # (middle_row is already created, no need to reassign)
+        # Split middle row into storage and GPU panels
+        layout["middle_row"].split_row(
+            Layout(name="storage", ratio=2),
+            Layout(name="gpu", ratio=1)
+        )
 
         # Split bottom row into three columns (CPU cores, top memory, top CPU)
         layout["bottom_row"].split_row(
@@ -616,7 +783,8 @@ class RichSystemMonitor:
         layout["system_info"].update(self.create_system_info_panel(stats))
         layout["resources"].update(self.create_resource_panel(stats))
         layout["animation"].update(self.create_animation_panel(stats))
-        layout["middle_row"].update(self.create_disk_panel(stats))
+        layout["storage"].update(self.create_disk_panel(stats))
+        layout["gpu"].update(self.create_gpu_panel())
         layout["cpu_cores"].update(self.create_cpu_cores_panel(stats))
         layout["top_memory"].update(self.create_top_memory_panel(processes))
         layout["top_cpu"].update(self.create_top_cpu_panel(processes))
