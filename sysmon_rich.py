@@ -61,9 +61,9 @@ class RichSystemMonitor:
         try:
             partitions = psutil.disk_partitions()
             for partition in partitions:
-                # Skip snap mounts, virtual filesystems, and boot partitions
+                # Skip snap mounts, virtual filesystems, boot partitions, and optical media
                 skip_mounts = ['/dev', '/proc', '/sys', '/run', '/boot', '/boot/efi']
-                if (partition.fstype in ['squashfs', 'tmpfs', 'devtmpfs'] or
+                if (partition.fstype in ['squashfs', 'tmpfs', 'devtmpfs', 'udf', 'iso9660'] or
                     '/snap/' in partition.mountpoint or
                     partition.mountpoint in skip_mounts):
                     continue
@@ -162,6 +162,123 @@ class RichSystemMonitor:
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, ValueError):
             return None
 
+    def get_gpu_processes(self):
+        """Get GPU process information using nvidia-smi"""
+        try:
+            result = subprocess.run([
+                'nvidia-smi',
+                '--query-compute-apps=gpu_uuid,pid,process_name,used_memory',
+                '--format=csv,noheader,nounits'
+            ], capture_output=True, text=True, timeout=5)
+
+            if result.returncode != 0:
+                return []
+
+            processes = []
+            for line in result.stdout.strip().split('\n'):
+                if line.strip():
+                    parts = [part.strip() for part in line.split(',')]
+                    if len(parts) >= 4:
+                        processes.append({
+                            'gpu_uuid': parts[0],
+                            'pid': int(parts[1]),
+                            'name': parts[2],
+                            'memory_used': int(parts[3])
+                        })
+
+            return processes
+
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, ValueError):
+            return []
+
+    def get_network_info(self):
+        """Get network connectivity information"""
+        try:
+            # Check connectivity to known hosts
+            hosts = {
+                'iMac Server': '192.168.0.77',
+                'Surface Pro': '192.168.0.116',
+                'Gateway': '192.168.0.1'
+            }
+
+            connectivity = {}
+            for name, ip in hosts.items():
+                try:
+                    result = subprocess.run(['ping', '-c', '1', '-W', '1', ip],
+                                          capture_output=True, timeout=3)
+                    connectivity[name] = result.returncode == 0
+                except:
+                    connectivity[name] = False
+
+            # Get network stats
+            net_io = psutil.net_io_counters()
+
+            return {
+                'connectivity': connectivity,
+                'bytes_sent': net_io.bytes_sent,
+                'bytes_recv': net_io.bytes_recv,
+                'packets_sent': net_io.packets_sent,
+                'packets_recv': net_io.packets_recv
+            }
+
+        except Exception:
+            return None
+
+    def get_disk_io_stats(self):
+        """Get disk I/O statistics"""
+        try:
+            # Get per-disk I/O stats
+            disk_io = psutil.disk_io_counters(perdisk=True)
+            return disk_io
+        except Exception:
+            return {}
+
+    def get_system_vitals(self):
+        """Get system temperature and fan information"""
+        vitals = {
+            'cpu_temps': [],
+            'fans': [],
+            'other_temps': []
+        }
+
+        try:
+            # Try to get sensor data using psutil
+            if hasattr(psutil, 'sensors_temperatures'):
+                temps = psutil.sensors_temperatures()
+                if temps:
+                    for name, entries in temps.items():
+                        for entry in entries:
+                            if 'coretemp' in name.lower():
+                                vitals['cpu_temps'].append({
+                                    'label': entry.label or f'Core {len(vitals["cpu_temps"])}',
+                                    'current': entry.current,
+                                    'high': entry.high,
+                                    'critical': entry.critical
+                                })
+                            else:
+                                vitals['other_temps'].append({
+                                    'label': entry.label or name,
+                                    'current': entry.current,
+                                    'high': entry.high,
+                                    'critical': entry.critical
+                                })
+
+            # Try to get fan data
+            if hasattr(psutil, 'sensors_fans'):
+                fans = psutil.sensors_fans()
+                if fans:
+                    for name, entries in fans.items():
+                        for entry in entries:
+                            vitals['fans'].append({
+                                'label': entry.label or name,
+                                'current': entry.current
+                            })
+
+        except Exception:
+            pass
+
+        return vitals
+
     def get_top_processes(self, count=8):
         """Get top processes by CPU and memory usage"""
         try:
@@ -201,24 +318,72 @@ class RichSystemMonitor:
         return f"[{color}]{bar}[/{color}] {percentage:5.1f}%"
     
     def create_system_info_panel(self, stats):
-        """Create system information panel without animation"""
+        """Create system information panel with compact load info"""
         if not stats:
             return Panel("Error loading system stats", title="System Info", border_style="red")
 
-        # Create enhanced load visualization
-        load_display = self._create_load_visualization(stats['load_avg'], len(stats['cpu_cores']))
+        # Get load info
+        load_1min = stats['load_avg'][0]
+        cpu_count = len(stats['cpu_cores'])
+        load_pct = (load_1min / cpu_count) * 100
 
-        # Create info text with focus on system specs and load
-        info_text = f"""🖥️  [bold white]{stats['hostname']}[/bold white]
-⚙️  [yellow]{len(stats['cpu_cores'])} CPU Cores[/yellow]
+        # Determine load status and color
+        if load_1min < 1:
+            load_status = "Light"
+            load_color = "green"
+        elif load_1min < cpu_count * 0.7:
+            load_status = "Normal"
+            load_color = "yellow"
+        elif load_1min < cpu_count:
+            load_status = "High"
+            load_color = "yellow"
+        else:
+            load_status = "Overload"
+            load_color = "red"
+
+        # Create compact load bar
+        bar_length = 12
+        filled = int(min(load_pct / 100 * bar_length, bar_length))
+        empty = bar_length - filled
+        load_bar = "█" * filled + "░" * empty
+
+        load_5min  = stats['load_avg'][1]
+        load_15min = stats['load_avg'][2]
+
+        # Get temperature data
+        vitals = self.get_system_vitals()
+        temp_lines = ""
+        if vitals['cpu_temps']:
+            cpu_temp = vitals['cpu_temps'][0]['current']
+            tc = "red" if cpu_temp > 80 else "yellow" if cpu_temp > 70 else "green"
+            temp_lines += f"\n🔥 CPU: [{tc}]{cpu_temp:.0f}°C[/{tc}]"
+        if vitals['other_temps']:
+            for temp in vitals['other_temps'][:2]:
+                if temp['current'] and temp['current'] > 0:
+                    tc = "red" if temp['current'] > 60 else "yellow" if temp['current'] > 45 else "green"
+                    label = temp['label']
+                    if 'temp1' in label or 'temp2' in label:
+                        dl = "Case"
+                    elif 'temp3' in label:
+                        dl = "Chipset"
+                    else:
+                        dl = label[:7]
+                    temp_lines += f"\n🌡️ {dl}: [{tc}]{temp['current']:.0f}°C[/{tc}]"
+
+        # Create info text with load and temps
+        info_text = f"""🖥️  [bold white]{stats['hostname'][:20]}[/bold white]
+⚙️  [yellow]{cpu_count} CPU Cores[/yellow]
 💾 [magenta]{stats['memory'].total / (1024**3):.1f} GB RAM[/magenta]
 
-{load_display}"""
+📊 [bold white]Load:[/bold white] [{load_color}]{load_bar}[/{load_color}] [{load_color}]{load_status}[/{load_color}]
+[dim]  1m[/dim]  [{load_color}]{load_1min:.2f}[/{load_color}]  [dim]5m[/dim]  [white]{load_5min:.2f}[/white]  [dim]15m[/dim]  [white]{load_15min:.2f}[/white]
+[dim]  [{load_color}]{load_pct:.1f}% of {cpu_count} cores[/{load_color}][/dim]
+{temp_lines}"""
 
         return Panel(info_text, title="[bold blue]🖥️ System Status[/bold blue]", border_style="blue")
 
     def create_animation_panel(self, stats):
-        """Create separate animation panel with time and uptime"""
+        """Create live status panel with time, uptime, network hosts and interfaces"""
         spinner_display = self._create_spinner_animation()
 
         # Get current time and date (human-friendly)
@@ -232,11 +397,21 @@ class RichSystemMonitor:
         else:
             uptime_str = "N/A"
 
-        # Combine animation with time info
-        time_info = f"""
-🕐 [bright_cyan]{current_time}[/bright_cyan]
+        # Network host connectivity
+        network_info = self.get_network_info()
+        host_lines = ""
+        if network_info:
+            for name, status in network_info['connectivity'].items():
+                icon = "✅" if status else "❌"
+                short_name = name.split()[0]
+                host_lines += f"\n  {icon} {short_name}"
+
+        # Combine: spinner + time on the left, network on the right
+        time_info = f"""🕐 [bright_cyan]{current_time}[/bright_cyan]
 📅 [dim]{current_date}[/dim]
-⏱️  [green]{uptime_str}[/green]"""
+⏱️  [green]{uptime_str}[/green]
+
+🌐 [bold white]Hosts:[/bold white]{host_lines}"""
 
         content = Columns([spinner_display, time_info], equal=False, expand=True)
         return Panel(content, title="[bold magenta]⚡ Live Status[/bold magenta]", border_style="magenta")
@@ -318,7 +493,7 @@ class RichSystemMonitor:
         return "\n".join(radiating)
 
     def _create_load_visualization(self, load_avg, cpu_count):
-        """Create enhanced load average visualization"""
+        """Create enhanced load average visualization with explanation"""
         load_1min, load_5min, load_15min = load_avg
 
         # Calculate load percentages relative to CPU count
@@ -328,7 +503,7 @@ class RichSystemMonitor:
 
         # Create visual bars for each load average
         def create_load_bar(load_val, load_pct):
-            bar_length = 12
+            bar_length = 10
             filled = int(min(load_pct / 100 * bar_length, bar_length))
             empty = bar_length - filled
 
@@ -345,53 +520,96 @@ class RichSystemMonitor:
             bar = "█" * filled + "░" * empty
             return f"[{color}]{bar}[/{color}] {load_val:4.2f} [{color}]{status}[/{color}]"
 
-        load_display = f"""📊 [bold white]System Load Average[/bold white]
+        # Determine overall system status
+        if load_1min < 1:
+            system_status = "[green]System: Light Load[/green]"
+        elif load_1min < cpu_count * 0.7:
+            system_status = "[yellow]System: Normal Load[/yellow]"
+        elif load_1min < cpu_count:
+            system_status = "[yellow]System: High Load[/yellow]"
+        else:
+            system_status = "[red]System: Overloaded[/red]"
+
+        load_display = f"""📊 [bold white]Load Average[/bold white] [dim](processes waiting)[/dim]
 ┌─ 1min:  {create_load_bar(load_1min, load_1_pct)}
 ├─ 5min:  {create_load_bar(load_5min, load_5_pct)}
-└─ 15min: {create_load_bar(load_15min, load_15_pct)}"""
+└─ 15min: {create_load_bar(load_15min, load_15_pct)}
+
+{system_status}"""
 
         return load_display
 
     def create_resource_panel(self, stats):
-        """Create resource usage panel"""
+        """Create resource usage panel with inline labeled bars"""
         if not stats:
             return Panel("Error loading resource stats", title="Resources", border_style="red")
 
-        table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
-        table.add_column("Resource", style="cyan", width=12)
-        table.add_column("Usage", style="white", width=15)
-        table.add_column("Visual", width=30)
+        def inline_bar(percent, width=14):
+            filled = int(percent / 100 * width)
+            color = "red" if percent > 80 else "yellow" if percent > 60 else "green"
+            return f"[{color}]{'█' * filled}[/{color}][dim]{'░' * (width - filled)}[/dim]", color
 
         # CPU
-        cpu_bar = self.create_progress_bar(stats['cpu_percent'])
-        table.add_row("CPU", f"{stats['cpu_percent']:.1f}%", cpu_bar)
+        cpu_pct = stats['cpu_percent']
+        cpu_bar, cpu_color = inline_bar(cpu_pct)
+        cpu_line = f"[bold cyan]CPU[/bold cyan]  {cpu_bar}  [{cpu_color}]{cpu_pct:5.1f}%[/{cpu_color}]"
 
         # Memory
-        mem_bar = self.create_progress_bar(stats['memory'].percent)
-        mem_used_gb = stats['memory'].used / (1024**3)
-        mem_total_gb = stats['memory'].total / (1024**3)
-        table.add_row("Memory", f"{stats['memory'].percent:.1f}% ({mem_used_gb:.1f}/{mem_total_gb:.1f} GB)", mem_bar)
+        mem_pct = stats['memory'].percent
+        mem_used = stats['memory'].used / (1024**3)
+        mem_total = stats['memory'].total / (1024**3)
+        mem_bar, mem_color = inline_bar(mem_pct)
+        mem_line = (f"[bold cyan]RAM[/bold cyan]  {mem_bar}  [{mem_color}]{mem_pct:5.1f}%[/{mem_color}]"
+                    f"  [dim]{mem_used:.0f}/{mem_total:.0f} GB[/dim]")
 
-        # Network (show totals)
-        net_sent = stats['network'].bytes_sent / (1024**2)  # MB
-        net_recv = stats['network'].bytes_recv / (1024**2)  # MB
-        table.add_row("Net Sent", f"{net_sent:.1f} MB", "")
-        table.add_row("Net Recv", f"{net_recv:.1f} MB", "")
+        # Network traffic
+        def fmt_bytes(b):
+            if b > 1024**3:
+                return f"{b / 1024**3:.1f} GB"
+            elif b > 1024**2:
+                return f"{b / 1024**2:.0f} MB"
+            else:
+                return f"{b / 1024:.0f} KB"
 
-        return Panel(table, title="[bold green]Resource Usage[/bold green]", border_style="green")
+        net = stats['network']
+        sent_line = f"[yellow]↑[/yellow] [dim]Sent[/dim]  [white]{fmt_bytes(net.bytes_sent):>9}[/white]"
+        recv_line = f"[cyan]↓[/cyan] [dim]Recv[/dim]  [white]{fmt_bytes(net.bytes_recv):>9}[/white]"
+        pkts_line = f"[dim]Pkts: {net.packets_sent:,}↑ {net.packets_recv:,}↓[/dim]"
+
+        # Active interfaces
+        iface_lines = ""
+        try:
+            addrs = psutil.net_if_addrs()
+            net_stats = psutil.net_if_stats()
+            for iface, iface_stat in net_stats.items():
+                if iface_stat.isup and iface not in ('lo', 'docker0') and not iface.startswith(('veth', 'br-')):
+                    ip = ""
+                    if iface in addrs:
+                        for addr in addrs[iface]:
+                            if addr.family.name == 'AF_INET':
+                                ip = addr.address
+                                break
+                    speed = f" {iface_stat.speed}Mb" if iface_stat.speed > 0 else ""
+                    iface_lines += f"\n[green]●[/green] {iface[:8]}{speed}"
+                    if ip:
+                        iface_lines += f" [dim]{ip}[/dim]"
+        except Exception:
+            pass
+
+        content = f"{cpu_line}\n{mem_line}\n\n{sent_line}\n{recv_line}\n{pkts_line}{iface_lines}"
+        return Panel(content, title="[bold green]Resource Usage[/bold green]", border_style="green")
 
     def create_disk_panel(self, stats):
-        """Create compact disk usage panel"""
+        """Create spacious disk usage panel that uses available width"""
         if not stats or not stats['disk_partitions']:
             return Panel("Error loading disk stats", title="Storage Dashboard", border_style="red")
 
-        # Create a table for more compact display
-        table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
-        table.add_column("Drive", width=12)
-        table.add_column("Usage", width=20)
-        table.add_column("Size", width=12)
+        table = Table(show_header=True, header_style="bold cyan", box=box.ROUNDED, padding=(0, 1))
+        table.add_column("Drive", style="white", width=18, no_wrap=True)
+        table.add_column("Usage", width=16, no_wrap=True)
+        table.add_column("Size", style="dim", width=12, no_wrap=True)
 
-        for disk in stats['disk_partitions'][:4]:  # Show up to 4 drives
+        for disk in stats['disk_partitions'][:6]:  # Show up to 6 drives
             # Determine icon and colors
             if disk['drive_type'] == 'system':
                 icon = "🖥️"
@@ -410,49 +628,50 @@ class RichSystemMonitor:
                 icon = "🔌"
                 color = "yellow"
 
-            # Create usage bar
+            # Create compact usage pill + percentage
             percent = disk['percent']
-            bar_length = 12
+            bar_length = 5
             filled = int(percent / 100 * bar_length)
             empty = bar_length - filled
 
-            if percent > 80:
+            if percent > 85:
                 bar_color = "red"
-            elif percent > 60:
+            elif percent > 70:
                 bar_color = "yellow"
-            else:
+            elif percent > 50:
                 bar_color = "green"
+            else:
+                bar_color = "blue"
 
             bar = "█" * filled + "░" * empty
-            usage_bar = f"[{bar_color}]{bar}[/{bar_color}] {percent:.0f}%"
+            usage_display = f"[{bar_color}]{bar}[/{bar_color}] [{bar_color}]{percent:4.1f}%[/{bar_color}]"
 
-            # Format sizes
-            if disk['total'] > 1024**4:  # TB
-                total_size = f"{disk['total'] / (1024**4):.1f}TB"
-                used_size = f"{disk['used'] / (1024**4):.1f}TB"
-            else:  # GB
-                total_size = f"{disk['total'] / (1024**3):.0f}GB"
-                used_size = f"{disk['used'] / (1024**3):.0f}GB"
-
-            # Get mount display name
+            # Descriptive but sized mount display names
             mount_path = disk['mountpoint']
             if mount_path == '/':
-                mount_display = 'root'
+                mount_display = 'System'
             elif 'ai-storage' in mount_path:
-                mount_display = 'ai-storage'
+                mount_display = 'AI Storage'
             elif 'cold-storage' in mount_path:
-                mount_display = 'cold-storage'
+                mount_display = 'Cold Storage'
             elif 'masstore' in mount_path:
-                mount_display = 'masstore02'
+                mount_display = 'Mass Storage'
+            elif 'Crucial' in mount_path:
+                mount_display = 'Crucial X10'
             else:
-                mount_display = mount_path.split('/')[-1][:10]
+                mount_display = mount_path.split('/')[-1].title()[:12]
 
             drive_info = f"{icon} [{color}]{mount_display}[/{color}]"
-            size_info = f"{used_size}/{total_size}"
 
-            table.add_row(drive_info, usage_bar, size_info)
+            # Compact but readable size format
+            if disk['total'] > 1024**4:  # TB
+                size_info = f"{disk['used'] / (1024**4):.1f}/{disk['total'] / (1024**4):.1f}TB"
+            else:  # GB
+                size_info = f"{disk['used'] / (1024**3):.0f}/{disk['total'] / (1024**3):.0f}GB"
 
-        return Panel(table, title="[bold cyan]💾 Storage Dashboard[/bold cyan]", border_style="cyan")
+            table.add_row(drive_info, usage_display, size_info)
+
+        return Panel(table, title="[bold cyan]💾 Storage Overview[/bold cyan]", border_style="cyan")
 
     def _create_drive_card(self, disk):
         """Create a card-style display for a single drive"""
@@ -544,66 +763,34 @@ class RichSystemMonitor:
         )
     
     def create_cpu_cores_panel(self, stats):
-        """Create CPU cores panel with vertical equalizer-style bars"""
+        """Create CPU cores panel as a 2-column horizontal bar layout"""
         if not stats:
             return Panel("Error loading CPU stats", title="CPU Cores", border_style="red")
 
-        # Create vertical equalizer display
-        max_height = 8  # Height of the equalizer bars
         cores = stats['cpu_cores']
+        bar_width = 5
+        half = len(cores) // 2  # split into two columns
 
-        # Build the equalizer from top to bottom
-        equalizer_lines = []
+        def core_bar(usage):
+            filled = max(int(usage / 100 * bar_width), 1 if usage > 0 else 0)
+            color = "red" if usage > 80 else "yellow" if usage > 60 else "green" if usage > 30 else "blue"
+            bar = f"[{color}]{'█' * filled}[/{color}][dim]{'░' * (bar_width - filled)}[/dim]"
+            pct = f"[{color}]{usage:3.0f}%[/{color}]"
+            return bar, pct
 
-        # Create vertical bars (from top to bottom)
-        for row in range(max_height):
-            line = ""
-            for i, usage in enumerate(cores):
-                # Calculate how many bars this core should have
-                bars_needed = int((usage / 100) * max_height)
+        lines = []
+        for i in range(half):
+            left_usage  = cores[i]
+            right_usage = cores[i + half] if (i + half) < len(cores) else 0
 
-                # Determine if this row should have a bar (counting from bottom)
-                current_row_from_bottom = max_height - row - 1
+            lb, lp = core_bar(left_usage)
+            rb, rp = core_bar(right_usage)
 
-                if current_row_from_bottom < bars_needed:
-                    # Choose color based on usage
-                    if usage > 80:
-                        color = "red"
-                    elif usage > 60:
-                        color = "yellow"
-                    elif usage > 30:
-                        color = "green"
-                    else:
-                        color = "blue"
+            left  = f"[dim]{i:>2}[/dim] {lb} {lp}"
+            right = f"[dim]{i + half:>2}[/dim] {rb} {rp}"
+            lines.append(f"{left}  [dim]│[/dim]  {right}")
 
-                    # Align bars with numbers: right-align in 2-char field + space
-                    if i < len(cores) - 1:
-                        line += f" [{color}]█[/{color}] "  # Space + bar + space to match " 0 "
-                    else:
-                        line += f" [{color}]█[/{color}]"   # Last: space + bar (matches "15")
-                else:
-                    # Show empty bar for contrast with same spacing
-                    if i < len(cores) - 1:
-                        line += " [dim]░[/dim] "  # Space + bar + space
-                    else:
-                        line += " [dim]░[/dim]"   # Last: space + bar
-
-            equalizer_lines.append(line.rstrip())
-
-        # Add core numbers at the bottom with consistent spacing
-        # Each column should be 2 characters wide to accommodate double-digit numbers
-        core_line = ""
-        for i, usage in enumerate(cores):
-            # Format each number to take exactly 2 characters (right-aligned)
-            core_line += f"{i:>2}"
-            if i < len(cores) - 1:
-                core_line += " "  # Single space between numbers
-
-        equalizer_lines.append(core_line)
-
-        equalizer_display = "\n".join(equalizer_lines)
-
-        return Panel(equalizer_display, title="[bold yellow]🎚️ CPU Equalizer[/bold yellow]", border_style="yellow")
+        return Panel("\n".join(lines), title="[bold yellow]🎚️ CPU Cores[/bold yellow]", border_style="yellow")
     
     def create_top_memory_panel(self, processes):
         """Create top memory processes panel"""
@@ -662,8 +849,9 @@ class RichSystemMonitor:
         return Panel(table, title="[bold yellow]⚡ Top CPU[/bold yellow]", border_style="yellow")
 
     def create_gpu_panel(self):
-        """Create GPU monitoring panel for dual GPU setup"""
+        """Create enhanced GPU monitoring panel with process information"""
         gpu_info = self.get_gpu_info()
+        gpu_processes = self.get_gpu_processes()
 
         if not gpu_info:
             return Panel(
@@ -688,14 +876,14 @@ class RichSystemMonitor:
             power_color = "red" if power_percent > 90 else "yellow" if power_percent > 75 else "green"
             util_color = "green" if gpu['utilization'] > 50 else "yellow" if gpu['utilization'] > 20 else "blue"
 
-            # Create compact VRAM usage bar
-            vram_bar_length = 12
+            # Create VRAM usage bar
+            vram_bar_length = 16
             vram_filled = int(vram_percent / 100 * vram_bar_length)
             vram_empty = vram_bar_length - vram_filled
             vram_bar = "█" * vram_filled + "░" * vram_empty
 
-            # Create compact utilization bar
-            util_bar_length = 10
+            # Create utilization bar
+            util_bar_length = 12
             util_filled = int(gpu['utilization'] / 100 * util_bar_length)
             util_empty = util_bar_length - util_filled
             util_bar = "█" * util_filled + "░" * util_empty
@@ -704,15 +892,25 @@ class RichSystemMonitor:
             vram_used_gb = gpu['memory_used'] / 1024
             vram_total_gb = gpu['memory_total'] / 1024
 
-            # Create compact GPU display
-            gpu_display = f"""🎮 [bold white]GPU {gpu['index']}: GTX 1080 Ti[/bold white]
-[{temp_color}]{gpu['temperature']}°C[/{temp_color}] [{power_color}]{gpu['power_draw']:.0f}W[/{power_color}] [{util_color}]{gpu['utilization']}%[/{util_color}]
-[{util_color}]{util_bar}[/{util_color}] Util
-[{vram_color}]{vram_bar}[/{vram_color}] {vram_used_gb:.1f}GB"""
+            # Create enhanced GPU display
+            gpu_display = f"""🎮 [bold white]GPU {gpu['index']}: {gpu['name']}[/bold white]
+┌─ [{temp_color}]{gpu['temperature']}°C[/{temp_color}] | [{power_color}]{gpu['power_draw']:.0f}W[/{power_color}] | [{util_color}]{gpu['utilization']}%[/{util_color}]
+├─ Util: [{util_color}]{util_bar}[/{util_color}]
+└─ VRAM: [{vram_color}]{vram_bar}[/{vram_color}] {vram_used_gb:.1f}GB"""
 
             gpu_displays.append(gpu_display)
             total_vram_used += gpu['memory_used']
             total_vram_total += gpu['memory_total']
+
+        # Add GPU processes if any
+        if gpu_processes:
+            process_display = "\n🔧 [bold yellow]Active Processes:[/bold yellow]"
+            for proc in gpu_processes[:3]:  # Show top 3 processes
+                proc_mem_gb = proc['memory_used'] / 1024
+                process_name = proc['name'][:12]  # Truncate long names
+                process_display += f"\n  • {process_name}: {proc_mem_gb:.1f}GB"
+        else:
+            process_display = "\n🔧 [dim]No active GPU processes[/dim]"
 
         # Add total VRAM summary
         total_vram_percent = (total_vram_used / total_vram_total) * 100
@@ -723,12 +921,73 @@ class RichSystemMonitor:
         total_display = f"\n💾 [bold {total_color}]Total: {total_used_gb:.1f}/{total_total_gb:.1f}GB[/bold {total_color}]"
 
         # Combine all displays
-        content = "\n\n".join(gpu_displays) + total_display
+        content = "\n\n".join(gpu_displays) + process_display + total_display
 
         # Determine overall border color based on any warnings
         border_color = "red" if any(gpu['temperature'] > 80 or (gpu['memory_used']/gpu['memory_total']) > 0.9 for gpu in gpu_info) else "green"
 
         return Panel(content, title="[bold cyan]🎮 GPU Dashboard[/bold cyan]", border_style=border_color)
+
+    def create_network_panel(self):
+        """Create network panel with connectivity and traffic stats"""
+        network_info = self.get_network_info()
+
+        if not network_info:
+            return Panel(
+                "[dim]Network info unavailable[/dim]",
+                title="[bold red]🌐 Network[/bold red]",
+                border_style="red"
+            )
+
+        # Connectivity status
+        lines = ["🌐 [bold white]Hosts:[/bold white]"]
+        for name, status in network_info['connectivity'].items():
+            icon = "✅" if status else "❌"
+            short_name = name.split()[0]
+            lines.append(f"  {icon} {short_name}")
+
+        # Traffic totals
+        def fmt_bytes(b):
+            if b > 1024**3:
+                return f"{b / 1024**3:.1f} GB"
+            elif b > 1024**2:
+                return f"{b / 1024**2:.0f} MB"
+            else:
+                return f"{b / 1024:.0f} KB"
+
+        lines.append("")
+        lines.append("📊 [bold white]Traffic:[/bold white]")
+        lines.append(f"  [yellow]↑[/yellow] Sent  [white]{fmt_bytes(network_info['bytes_sent'])}[/white]")
+        lines.append(f"  [cyan]↓[/cyan] Recv  [white]{fmt_bytes(network_info['bytes_recv'])}[/white]")
+        lines.append(f"  [dim]Pkts: {network_info['packets_sent']:,}↑ {network_info['packets_recv']:,}↓[/dim]")
+
+        # Active interfaces
+        try:
+            addrs = psutil.net_if_addrs()
+            net_stats = psutil.net_if_stats()
+            lines.append("")
+            lines.append("🔗 [bold white]Interfaces:[/bold white]")
+            for iface, stats_list in net_stats.items():
+                if stats_list.isup and iface not in ('lo', 'docker0') and not iface.startswith(('veth', 'br-')):
+                    speed = f"{stats_list.speed}Mb" if stats_list.speed > 0 else ""
+                    # Get IP if available
+                    ip = ""
+                    if iface in addrs:
+                        for addr in addrs[iface]:
+                            if addr.family.name == 'AF_INET':
+                                ip = addr.address
+                                break
+                    detail = f" {speed}" if speed else ""
+                    lines.append(f"  [green]●[/green] {iface[:8]}{detail}")
+                    if ip:
+                        lines.append(f"    [dim]{ip}[/dim]")
+        except Exception:
+            pass
+
+        all_connected = all(network_info['connectivity'].values())
+        border_color = "green" if all_connected else "yellow"
+
+        return Panel("\n".join(lines), title="[bold magenta]🌐 Network[/bold magenta]", border_style=border_color)
 
     def create_layout(self):
         """Create the enhanced main layout with GPU panel next to storage"""
@@ -743,8 +1002,8 @@ class RichSystemMonitor:
         # Split body into three rows for better organization
         layout["body"].split_column(
             Layout(name="top_row", ratio=2),
-            Layout(name="middle_row", ratio=3),  # Storage + GPU row
-            Layout(name="bottom_row", ratio=2)   # 3-column section
+            Layout(name="middle_row", ratio=2),  # Storage + GPU row
+            Layout(name="bottom_row", ratio=3)   # 3-column section
         )
 
         # Split top row into three columns (system info, resources, and animation)
@@ -754,10 +1013,10 @@ class RichSystemMonitor:
             Layout(name="animation", ratio=1)
         )
 
-        # Split middle row into storage and GPU panels
+        # Split middle row into two panels: storage + GPU
         layout["middle_row"].split_row(
-            Layout(name="storage", ratio=2),
-            Layout(name="gpu", ratio=1)
+            Layout(name="storage", ratio=3),
+            Layout(name="gpu", ratio=2)
         )
 
         # Split bottom row into three columns (CPU cores, top memory, top CPU)
